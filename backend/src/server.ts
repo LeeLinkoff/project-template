@@ -17,6 +17,7 @@ import express, { Request, Response } from "express";
 import cors from "cors";
 import swaggerUi from "swagger-ui-express";
 import swaggerSpec from "./swagger-spec";
+import { LOG_LEVEL, logSummary, requestLogger } from "./logging/logger";
 
 import {
   createItem,
@@ -30,6 +31,28 @@ const PORT = process.env.PORT || 3002;
 
 app.use(cors());
 app.use(express.json());
+
+app.use(cors());
+app.use(express.json());
+
+// Global request logger.
+//
+// Because this middleware is registered with app.use() before the API
+// routes below, every request that reaches those routes passes through
+// requestLogger automatically. Individual route handlers therefore do
+// not need their own summary logging calls.
+//
+// At LOG_LEVEL=summary, requestLogger writes one completion line containing
+// the HTTP method, URL, final response status, and elapsed time.
+// At LOG_LEVEL=verbose, it also writes request/response diagnostic details.
+// At LOG_LEVEL=none, it immediately calls next() without logging anything.
+app.use(requestLogger);
+
+/**
+ * GET /api/health
+ */
+app.get("/api/health", (_req: Request, res: Response) => {
+app.use(requestLogger);
 
 /**
  * GET /api/health
@@ -91,6 +114,7 @@ app.post("/api/items", (req: Request, res: Response) => {
 });
 
 app.listen(PORT, () => {
-  console.log(`generic-backend listening on port ${PORT}`);
-  console.log(`Swagger docs: http://localhost:${PORT}/api/docs`);
+  logSummary(`generic-backend listening on port ${PORT}`);
+  logSummary(`Swagger docs: http://localhost:${PORT}/api/docs`);
+  logSummary(`Logging: ${LOG_LEVEL}`);
 });
