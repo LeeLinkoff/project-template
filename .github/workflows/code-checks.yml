@@ -1,0 +1,256 @@
+name: Code Checks (type-check + boot test)
+
+# ============================================================
+# PURPOSE: Confirm the backend is sound. Does NOT touch the VPS
+# and does NOT deploy anything. This is a pass/fail gate only.
+#
+# TRIGGERS: automatically, on every push to main AND every pull
+# request targeting main; also runnable by hand from the GitHub
+# Actions tab (workflow_dispatch), useful after clearing run
+# history, since a workflow with no runs and no workflow_dispatch
+# disappears from the Actions sidebar entirely. Runs on GitHub's
+# disposable runner, never on your VPS.
+# ============================================================
+#
+# Three jobs. frontend-build is independent and listed first; the
+# other two, in increasing order of what they actually require,
+# cover the backend:
+#   1. frontend-build — installs deps, runs the real production
+#      build (npm run build), and confirms dist/index.html actually
+#      got created. Independent of the other two jobs, runs in
+#      parallel, not sequentially after them.
+#   2. type-check — regenerates schemas.generated.ts (swagger-spec.ts
+#      imports it, it doesn't exist in a fresh checkout otherwise),
+#      then confirms the full backend type-checks cleanly under
+#      strict: true (npx tsc --noEmit). Stronger than a plain-JS
+#      syntax check: this catches real type errors, not just parse
+#      errors. No secrets needed, always runs.
+#   3. boot-test     — installs deps, confirms they actually
+#      installed, regenerates schemas.generated.ts, compiles
+#      (npm run build), boots the compiled server (dist/server.js,
+#      the same artifact Docker/production actually runs), and
+#      checks the actual response BODY of /api/health (not just an
+#      HTTP 2xx), /api/docs, plus confirms /api/verify returns 400
+#      on a request with no image. services/extraction.ts and
+#      services/matching.ts are both implemented now, extraction
+#      calls a real OpenAI vision model, so this job's own missing-
+#      image check exercises real validation logic, not a stub. It
+#      still does NOT exercise the real vision call end to end
+#      (that needs an OPENAI_API_KEY secret here plus a real test
+#      label image); add a real eval-harness job for that later,
+#      same pattern as insight-engine-rag's eval-harness job checks
+#      for OPENAI_API_KEY before running.
+#
+# Every multi-line `run:` block below uses `set -euo pipefail`, not
+# just `set -e`: `-u` fails loudly on an unset variable instead of
+# silently treating it as empty, and `-o pipefail` makes a failure
+# anywhere in a piped command fail the whole step instead of only
+# reflecting the exit code of the last command in the pipe. This is
+# the same standard used in deploy-to-vps.yml.
+#
+# NOTE: There is still no eval harness job here. services/extraction.ts
+# and services/matching.ts are now implemented (they no longer throw
+# "not implemented"), so this is no longer blocked on the logic not
+# existing, it's just not built yet. Add one the same way
+# insight-engine-rag's ci.yml does: gate on an OPENAI_API_KEY secret,
+# boot the server, run a fixed set of test labels through /api/verify,
+# and assert on expected match/no-match results per field.
+#
+# RELATIONSHIP TO deploy-to-vps.yml: deploy-to-vps.yml's own
+# verify-build job re-runs a similar (not identical) set of checks
+# as a final gate immediately before touching the VPS. That overlap
+# is deliberate, not a mistake, this file is the fast day-to-day
+# check on every push/PR, deploy-to-vps.yml's copy is a last-line
+# check right before production changes.
+
+"on":
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  # Without this, the workflow only shows in the Actions sidebar
+  # while at least one run exists. Clear the run history with no
+  # workflow_dispatch defined and the workflow disappears entirely,
+  # with no way to trigger it manually until the next real push.
+  workflow_dispatch: {}
+
+jobs:
+  frontend-build:
+    name: Frontend build check
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: frontend
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install dependencies
+        run: npm install
+
+      - name: Production build
+        run: npm run build
+
+      - name: Confirm build output exists
+        run: |
+          set -euo pipefail
+          if [ ! -f "dist/index.html" ]; then
+            echo "ERROR: npm run build reported success but dist/index.html is missing."
+            echo "Check vite.config.js for a custom build.outDir pointing elsewhere."
+            exit 1
+          fi
+          echo "Frontend build output confirmed at dist/index.html"
+
+  type-check:
+    name: Type check (TypeScript, strict)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: backend
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install dependencies
+        # Full install, not --omit=dev: typescript, @types/*, and the
+        # OpenAPI schema generator (ts-json-schema-generator, ts-node)
+        # are all devDependencies, needed here to type-check and to
+        # generate schemas.generated.ts.
+        run: npm install
+
+      - name: Generate OpenAPI schemas
+        # swagger-spec.ts imports ./schemas.generated, which doesn't
+        # exist in a fresh checkout, it's a build artifact (see
+        # scripts/generate-openapi-schemas.ts). Without this step,
+        # the next step fails on a missing module, not a real type
+        # error.
+        run: npm run generate:schemas
+
+      - name: Type-check entire backend (no output emitted)
+        run: npx tsc --noEmit
+
+  boot-test:
+    name: Boot test (live server, compiled output)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: backend
+    needs: [type-check]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install dependencies
+        run: npm install
+
+      - name: Confirm dependencies actually installed
+        # npm install can exit 0 in edge cases (cache issues, partial
+        # installs) without producing a usable node_modules. Fail here
+        # with a clear message instead of a confusing "Cannot find
+        # module 'express'" a step later when the server tries to boot.
+        run: |
+          set -euo pipefail
+          if [ ! -d "node_modules" ]; then
+            echo "ERROR: node_modules not found after npm install."
+            exit 1
+          fi
+          if [ ! -d "node_modules/express" ]; then
+            echo "ERROR: node_modules exists but express is missing. Install may be incomplete."
+            exit 1
+          fi
+          echo "Dependencies confirmed installed."
+
+      - name: Start server in background
+        env:
+          PORT: 3002
+        run: |
+          set -euo pipefail
+          npm run generate:schemas
+          npm run build
+          nohup node dist/server.js > server.log 2>&1 &
+          echo $! > server.pid
+
+      - name: Wait for server to become healthy
+        run: |
+          set -euo pipefail
+          for i in $(seq 1 20); do
+            if curl -sf http://127.0.0.1:3002/api/health > /dev/null; then
+              echo "Server is up"
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "Server did not become healthy in time"
+          cat server.log
+          exit 1
+
+      - name: Confirm /api/health response body reports ok:true
+        # A 2xx status alone doesn't prove the service is actually
+        # healthy, a handler bug could return 200 with {"ok": false}
+        # or malformed JSON and the previous step would still pass.
+        # Check the actual body, not just the status code.
+        run: |
+          set -euo pipefail
+          BODY=$(curl -sf http://127.0.0.1:3002/api/health)
+          echo "Response body: $BODY"
+          OK=$(echo "$BODY" | node -e "let d='';process.stdin.on('data',c=>d+=c);process.stdin.on('end',()=>{try{console.log(JSON.parse(d).ok===true)}catch(e){console.log('false')}})")
+          if [ "$OK" != "true" ]; then
+            echo "ERROR: /api/health responded but body did not report ok:true."
+            exit 1
+          fi
+          echo "/api/health body confirmed ok:true."
+
+      - name: Confirm Swagger docs respond
+        run: |
+          set -euo pipefail
+          STATUS=$(curl -s -o /dev/null -w "%{http_code}" -L http://127.0.0.1:3002/api/docs)
+          if [ "$STATUS" != "200" ]; then
+            echo "Expected 200 from /api/docs, got $STATUS"
+            exit 1
+          fi
+          echo "/api/docs confirmed 200."
+
+      - name: Confirm /api/verify rejects a request with no image
+        # /api/verify is now implemented (services/extraction.ts and
+        # services/matching.ts no longer throw "not implemented").
+        # This step used to just check for "any non-200" as a stub
+        # sanity check; now that there's real validation, assert the
+        # specific expected code: 400, from server.ts's own check for
+        # a missing labelImage. This still catches the same class of
+        # regression the old check did (a silent, accidental 200 with
+        # no real data), just with a tighter, now-meaningful assertion
+        # instead of a placeholder one.
+        #
+        # This deliberately does NOT exercise the real vision call
+        # (that would need OPENAI_API_KEY as a secret here, and a real
+        # test label image checked into the repo or fetched at
+        # runtime). Only the pre-extraction validation path is
+        # covered. Add a real eval harness job (boot server, POST an
+        # actual label through /api/verify, assert on expected
+        # match/no-match per field) once you're ready to wire up that
+        # secret, same pattern as insight-engine-rag's eval-harness job.
+        run: |
+          set -euo pipefail
+          STATUS=$(curl -s -o /dev/null -w "%{http_code}" -X POST http://127.0.0.1:3002/api/verify)
+          if [ "$STATUS" != "400" ]; then
+            echo "Expected 400 (missing labelImage) from /api/verify with no body, got $STATUS"
+            exit 1
+          fi
+          echo "/api/verify confirmed 400 on missing labelImage."
+
+      - name: Show server log on failure
+        if: failure()
+        run: cat server.log
+
+      - name: Stop server
+        if: always()
+        run: kill "$(cat server.pid)" 2>/dev/null || true
