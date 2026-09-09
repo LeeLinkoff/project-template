@@ -15,7 +15,7 @@
 //     Writes application startup messages and one completion line for each
 //     request handled by requestLogger(), for example:
 //
-//       [request] GET /api/health -> 200 (3ms)
+//       [request] GET /health -> 200 (3ms)
 //
 //   verbose
 //     Includes everything from summary plus request and response diagnostic
@@ -26,9 +26,12 @@
 // to "none". This keeps logging opt-in for applications created from this
 // template.
 
+
 import { NextFunction, Request, Response } from "express";
 
+
 export type LogLevel = "none" | "summary" | "verbose";
+
 
 const VALID_LEVELS: LogLevel[] = [
   "none",
@@ -50,11 +53,28 @@ const configuredLevel =
   (process.env.LOG_LEVEL || "none").toLowerCase();
 
 // Invalid values intentionally fall back to "none" rather than enabling
-// logging unexpectedly.
-export const LOG_LEVEL: LogLevel =
-  VALID_LEVELS.includes(configuredLevel as LogLevel)
-    ? (configuredLevel as LogLevel)
-    : "none";
+// logging unexpectedly. Printed as an error (not a warning) because a
+// misconfigured LOG_LEVEL silently running with no logging is a real
+// setup problem, not just a minor heads-up — this should be visible the
+// moment the backend starts. Only fires when LOG_LEVEL was actually set
+// to something unrecognized — an unset LOG_LEVEL (the normal default-off
+// case) does not trigger this.
+if (
+  process.env.LOG_LEVEL !== undefined &&
+  !VALID_LEVELS.includes(configuredLevel as LogLevel)
+) {
+  console.error(
+    `[logging] Invalid LOG_LEVEL="${process.env.LOG_LEVEL}" — that value ` +
+    `is not supported, defaulting to "none". Valid values are: ` +
+    `${VALID_LEVELS.join(", ")}.`
+  );
+}
+
+export const LOG_LEVEL: LogLevel = VALID_LEVELS.includes(
+  configuredLevel as LogLevel
+)
+  ? (configuredLevel as LogLevel)
+  : "none";
 
 
 // ---------------------------------------------------------------------------
@@ -101,7 +121,7 @@ function redactHeaders(headers: Request["headers"]) {
 
 // Recursively redact known sensitive properties from objects and arrays.
 //
-// Recursive processing is useful because credentials may appear inside nested
+// Recursive processing is useful because credentials may appear nested
 // request objects rather than only at the top level.
 function redactBody(value: unknown): unknown {
   if (Array.isArray(value)) {
@@ -194,22 +214,23 @@ export function logError(
 // Express request logging middleware
 // ---------------------------------------------------------------------------
 //
-// Register this middleware BEFORE the API routes in server.ts:
+// Register this middleware BEFORE the routes in server.ts:
 //
-//   app.use("/api", requestLogger);
+//   app.use(requestLogger);
 //
 // Express executes middleware in registration order. Because requestLogger is
-// mounted before the API routes, every request under /api automatically passes
-// through this function. Individual API handlers therefore do NOT need their
-// own summary logging calls.
+// mounted before the routes (with no path prefix), every request — /health,
+// /docs, and everything under /api — automatically passes through this
+// function. Individual route handlers therefore do NOT need their own
+// summary logging calls.
 //
 // Example:
 //
-//   GET /api/health
+//   GET /health
 //
 // automatically produces:
 //
-//   [request] GET /api/health -> 200 (3ms)
+//   [request] GET /health -> 200 (3ms)
 //
 // when LOG_LEVEL is summary or verbose.
 //

@@ -1,438 +1,480 @@
-# TTB Label Verification — Architecture and Deployment
+# Generic Project Template — Architecture and Deployment
 
-This document covers how the system is put together and how it gets
-to production. Unlike insight-engine-rag, deployment here was
-automated from day one via `deploy-to-vps.yml` rather than built
-manually first, so this is written as reference and manual-fallback
-documentation, not a step-by-step first-deploy walkthrough. If the
-pipeline itself ever needs debugging, this is what it's actually
-doing under the hood.
+This document describes the architecture supplied by the generic project template and the deployment scaffolding included with it. It is deliberately application-neutral.
 
-**A note on scope:** some of what's below (the exact Apache config
-path, the `httpd` vs `apache2` naming, the cPanel-specific restart
-command) is specific to this particular Bluehost VPS, not general
-best practice or something the assessment itself asked for. It's kept
-here in detail because it's genuinely useful for maintaining this
-deployment later, not because it's meant to be evaluated. The
-architecture decisions (why TypeScript, why this service split, why
-this deployment pattern) are the parts actually worth reading closely.
-
----
+**Important:** when a real application is created from this template, update this document to describe that application's actual architecture and deployment. Names, routes, ports, dependencies, public paths, secrets, infrastructure, and operational assumptions shown here are starting points, not permanent requirements.
 
 # PART 1: ARCHITECTURE
 
----
-
 ## 1.1 System overview
 
-```
+The template is a conventional thin-client web application:
+
+```text
 Browser
+  |
+  v
+React/Vite frontend
+  |
+  | HTTP/JSON
+  v
+Express + TypeScript backend
+  |
+  +--> services/
+  |      |
+  |      +--> db/       (optional PostgreSQL persistence)
+  |      +--> clients/  (external HTTP integrations)
+  |
+  +--> /health          (service/dependency diagnostics)
+  +--> /docs            (Swagger UI)
+  +--> /api/items       (example business resource)
+```
+
+The frontend is intentionally thin. The backend owns the primary service/business boundaries and provides an example Items API that should be replaced with the real application's domain functionality.
+
+## 1.2 Repository structure
+
+At a high level:
+
+```text
+<project>/
+├── backend/
+│   ├── scripts/
+│   ├── seeds/
+│   ├── src/
+│   │   ├── clients/
+│   │   ├── db/
+│   │   ├── logging/
+│   │   ├── middleware/
+│   │   ├── routes/
+│   │   ├── schemas/
+│   │   ├── services/
+│   │   ├── server.ts
+│   │   ├── swagger-spec.ts
+│   │   └── schemas.generated.ts
+│   ├── Dockerfile
+│   ├── package.json
+│   └── tsconfig.json
+├── frontend/
+│   ├── src/
+│   │   ├── api/
+│   │   ├── components/
+│   │   ├── logging/
+│   │   ├── App.jsx
+│   │   └── main.jsx
+│   ├── package.json
+│   └── vite.config.js
+├── .github/workflows/
+├── .githooks/
+├── dev_scripts/
+├── IMPORTANT_RUN_FIRST.bat
+├── README.md
+├── DESIGN_CONSIDERATIONS.md
+└── ARCHITECTURE_AND_DEPLOYMENT.md
+```
+
+## 1.3 First-run setup
+
+Immediately after creating a new project from the template, run the repository-root `IMPORTANT_RUN_FIRST.bat` once:
+
+```bat
+IMPORTANT_RUN_FIRST.bat
+```
+
+The script installs the dependencies declared by both application halves, running `npm install` first in `backend/` and then in `frontend/`. It exits with an error if either installation fails and reports completion only after both succeed.
+
+This is a bootstrap step, not the command used to start the application. Normal development/build commands can be used after it completes, and the script does not need to be run again unless dependencies need reinstalling. When adapting the template to a real application, revise this script if that application's initial setup requires additional steps.
+
+## 1.4 Backend architecture
+
+The backend is Express + TypeScript. TypeScript is the source of record and is compiled to JavaScript in `dist/`.
+
+Current compiler characteristics include:
+
+```text
+target: ES2022
+module: NodeNext
+moduleResolution: NodeNext
+strict: true
+```
+
+Because the backend uses NodeNext/native ESM semantics, relative TypeScript imports use the runtime `.js` extension. For example, a TypeScript source file may contain:
+
+```typescript
+import systemRouter from "./routes/system_router.js";
+```
+
+while the source file on disk is `system_router.ts`. TypeScript resolves the source correctly and emits JavaScript whose import remains valid when executed by Node.
+
+### Backend responsibilities
+
+- **`src/server.ts`** — application wiring only: Express setup, global middleware, router mounting, error handler, and startup.
+- **`src/routes/`** — HTTP routing and request/response wiring. Routes should remain thin.
+- **`src/services/`** — application/service logic and TypeScript contracts.
+- **`src/schemas/`** — Zod runtime-validation schemas for incoming request data.
+- **`src/middleware/`** — validation, authentication scaffold, async handling, and centralized HTTP error mapping.
+- **`src/db/pool.ts`** — PostgreSQL pool/connection boundary.
+- **`src/clients/http-client.ts`** — generic outbound HTTP client with timeout/error handling.
+- **`src/logging/logger.ts`** — configurable request/diagnostic logging.
+- **`src/swagger-spec.ts`** — OpenAPI document and explicit API paths.
+- **`src/schemas.generated.ts`** — generated OpenAPI component schemas; do not hand-edit.
+- **`scripts/generate-openapi-schemas.ts`** — build-time schema generator.
+
+### Request flow
+
+The intended application flow is:
+
+```text
+HTTP request
     |
     v
-Apache (HTTPS) -- leelinkoff.com
+route
     |
-    |-- /mvps/label-verify/api/*   --->  Docker container (127.0.0.1:3002, internal only)
+    +--> middleware (validation/auth as applicable)
     |
-    |-- /mvps/label-verify/*       --->  /home/leelinko/public_html/mvps/label-verify (static files)
-```
-
-Same shape as insight-engine-rag, deliberately: Apache terminates
-HTTPS and reverse-proxies API traffic to a backend container that
-never exposes a public port directly, static frontend files are
-served straight off disk. Two apps, two subpaths, two internal
-ports (3001 for RAG, 3002 for this one), one VPS, one Apache config.
-
-### Where things actually live on the VPS
-
-Three different locations matter, and they are not the same thing:
-
-| Location | What it is | Is it served publicly? |
-|---|---|---|
-| `/opt/label-verify` (`VPS_PROJECT_PATH`) | Where `deploy-to-vps.yml` rsyncs the source code to, and where both the backend's Docker build and the frontend's throwaway-container build happen. Contains `backend/` and `frontend/` source, plus `frontend/dist/` after a build. | **No.** This is a build/staging location only. Nothing under this path is reachable from a browser. |
-| `backend/Dockerfile` (a real, plain text file, at `/opt/label-verify/backend/Dockerfile` on the VPS) | The build recipe: base image, what to copy in, `npm install`, `npx tsc`, what command to run. This is the only thing in this whole chain that's an actual file you can open and read. Never modified or consumed during deploy, `docker build` just re-reads it each time. | N/A, it's source, not a runtime artifact. |
-| Docker **image** `ttb-label-verify-backend`, built by `docker build` reading the Dockerfile above | A static, inert template, compiled TypeScript + `node_modules`, stored inside Docker's own internal storage on the VPS, not a file you'd browse to directly. Built but not running. | No, images don't run. |
-| Docker **container** `ttb-label-verify-backend` | A live, running instance created *from* that image. This is the actual running process, the thing listening on `127.0.0.1:3002`. Same name string as the image above by convention here, but a genuinely different Docker object, list images with `docker images`, list containers with `docker ps -a`. | **No**, not directly. Only reachable through Apache's reverse proxy. |
-| `/home/leelinko/public_html/mvps/label-verify` | Where the frontend's *built* output (`/opt/label-verify/frontend/dist/*`) gets copied to after each build. This is Apache's actual document root for this app's static files. | **Yes.** This is what a browser actually receives when it requests `/mvps/label-verify/*`. |
-
-The backend's chain, spelled out:
-
-```
-backend/Dockerfile (real file, synced to /opt/label-verify/backend/)
-    |  read by `docker build`
     v
-Docker image "ttb-label-verify-backend" (not a file, Docker's internal storage)
-    |  instantiated by `docker run`
+service
+    |
+    +--> database and/or external client as needed
+    |
     v
-Docker container "ttb-label-verify-backend" (the actual running process, listens on 127.0.0.1:3002)
+result
+    |
+    v
+HTTP response
 ```
 
-So the flow for the frontend specifically is: source lives in
-`/opt/label-verify/frontend`, gets built into
-`/opt/label-verify/frontend/dist`, then that build output gets
-copied (via `rsync`) into `/home/leelinko/public_html/mvps/label-verify`,
-which is the only one of these three locations Apache actually serves
-from. The backend's "output" is different in kind, not files copied
-somewhere, but an image built once and a container created from it.
-Rebuilding on a later deploy replaces the image, then the old
-container is removed and a new one created from the new image, the
-container itself is never "updated" in place.
+Thrown errors flow through `asyncHandler` to the centralized `errorHandler`, which maps known errors to HTTP responses. Unexpected failures are treated as server errors rather than being shaped independently by every route.
 
-## 1.2 Backend architecture
+## 1.5 Current template endpoints
 
-Written in TypeScript (`strict: true`), not plain JavaScript, unlike
-insight-engine-rag's backend, which keeps parallel `.ts` files as a
-type-checking aid but still deploys the plain-JS originals. Here,
-TypeScript is the only source, compiled to `dist/` and that compiled
-output is what actually runs, both locally in production mode and in
-the deployed Docker container.
+The template currently exposes:
 
-**Why the backend runs in Docker rather than as a plain Node process
-directly on the VPS:** same reason the frontend build has to run in a
-container too, the VPS host has no working Node install at all,
-confirmed by insight-engine-rag's own deployment notes: a broken,
-extremely outdated Node environment missing required shared libraries
-(e.g. `libbrotlidec.so.1`). Node cannot run natively on this host, so
-the backend genuinely has no alternative to running inside a
-container, it isn't a stylistic choice. `--restart unless-stopped`
-also brings the container back automatically after a VPS reboot,
-which a bare host process wouldn't get without separately setting up
-something like `systemd` or `pm2`.
-
-All backend source lives under `backend/`:
-
-- **`server.ts`** — Thin router only. Parses each request, calls a
-  service function, shapes the response. No business logic lives
-  here.
-
-- **`services/extraction.ts`** — `extractLabelFields(imageBuffer,
-  mimeType) -> fields`. Calls an OpenAI vision model (Chat Completions
-  API, `image_url` content) to extract label fields. Model is
-  env-configurable via `OPENAI_VISION_MODEL`. Pure function, no
-  Express dependency. Exports the `ExtractedLabelFields` interface.
-
-- **`services/matching.ts`** — `matchLabelToApplication(extracted,
-  data) -> per-field match result`. Holds the canonical Government
-  Warning text (27 CFR 16.21/16.22) and `normalize()`. Pure function.
-  Exports `ApplicationData`, `FieldMatchResult`, and `MatchResult`
-  interfaces.
-
-- **`services/batch.ts`** — `verifyBatch(items) -> per-item results`.
-  Orchestrates extraction + matching per item with per-item error
-  isolation.
-
-- **`swagger-spec.ts`** — OpenAPI 3.0 spec. `components.schemas` is
-  generated directly from the actual TS interfaces in `services/`
-  (see `schemas.generated.ts` and `scripts/generate-openapi-schemas.ts`,
-  run via `npm run generate:schemas`), so response shapes can't drift
-  out of sync with the code. `paths` (routes, verbs, request bodies,
-  status codes) is still hand-maintained, Express doesn't carry that
-  metadata anywhere for a generator to read.
-
-- **`scripts/generate-openapi-schemas.ts`** — Generates
-  `schemas.generated.ts` from the exported service interfaces using
-  `ts-json-schema-generator`, then fixes up JSON-Schema-to-OpenAPI-3.0
-  differences (nullable unions, `$ref` paths). Build-time only, never
-  runs against a live request.
-
-- **`tsconfig.json`** — `strict: true`, `outDir dist`.
-
-- **`Dockerfile`** — `node:20-alpine`, port 3002. Full `npm install`
-  (needs devDependencies to compile and to run the schema generator),
-  then `npm run generate:schemas && npx tsc` (order matters,
-  `swagger-spec.ts` imports the generated file), then runs the
-  compiled `dist/server.js`.
-
-**Why services are split from routing:** each service function takes
-plain data in and returns plain data out, with zero dependency on
-Express's `req`/`res`. That's the part most likely to move to
-AWS/Azure (Lambda, Step Functions) if this prototype informs a real
-procurement decision. A Lambda handler for `extractLabelFields`
-later is a thin wrapper around the same function, not a rewrite.
-
-## 1.3 Frontend architecture
-
-All frontend source lives under `frontend/src/`:
-
-- **`main.jsx`** — Entry point, mounts App.
-
-- **`App.jsx`** — Owns app state. Currently just the health check
-  result; will become the shared-state owner for the full
-  upload/verify/results flow once built.
-
-- **`App.css`** — Design tokens and base styles, reused directly
-  from insight-engine-rag (`--accent`, `--card`, `--border`,
-  `--radius`, etc) for visual consistency across MVPs.
-
-Skeleton only right now, see `frontend/README.md`'s "Planned
-structure" section for where this splits into `components/` and
-`api/` once the upload/verify UI is built, mirroring
-insight-engine-rag's separation of networking from presentation.
-
-## 1.4 Why reuse an existing app as the starting point
-
-This project deliberately started from
-[insight-engine-rag](https://github.com/LeeLinkoff/insight-engine-rag)
-rather than a blank slate. Reused directly: the Docker + Apache
-reverse-proxy deployment pattern, the CI/CD pipeline shape, and the
-frontend's design tokens. Built new: the vision/OCR extraction logic
-and the field-matching logic, since those solve a genuinely different
-problem than RAG's text embeddings and have no equivalent to reuse.
-See the top-level `README.md`'s "Why reuse, not reinvent" section for
-the full reasoning.
-
----
-
-# PART 2: DEPLOYMENT
-
----
-
-## 2.1 Automated deployment (how this actually happens)
-
-Deployment is handled entirely by
-`.github/workflows/deploy-to-vps.yml`, triggered automatically on
-every push to `main`, or manually via GitHub Actions' "Run workflow"
-button. Two jobs:
-
-1. **`verify-build`** — runs on GitHub's own disposable runner, never
-   touches the VPS. Syntax-checks the backend, does a real `docker
-   build`, installs and builds the frontend, confirms `dist/index.html`
-   exists. If any of this fails, nothing below runs and the VPS is
-   never touched.
-2. **`deploy`** — only runs if `verify-build` passed. Confirms all
-   required secrets are present (fails immediately with a clear
-   message naming exactly which are missing, rather than failing
-   confusingly mid-SSH), creates the VPS project directories if they
-   don't exist (`mkdir -p`, safe to re-run), syncs source, writes
-   `backend/.env` from the `OPENAI_API_KEY` secret, rebuilds and
-   restarts the backend container, confirms via `docker ps` that it's
-   actually running (not just that `docker run` exited 0), builds the
-   frontend on the VPS itself inside a throwaway container, confirms
-   the build output exists, copies it into Apache's static directory,
-   confirms it landed, then verifies `/api/health` responds through
-   the public domain with the response body printed either way.
-
-See `.github/workflows/deploy-to-vps.yml`'s own header comment for
-the full list of required repository secrets and what each holds.
-`dev_scripts\deploy_setup.bat` automates setting them: generates a
-dedicated SSH keypair into `secrets\` if one doesn't exist, prints
-the public key to add to the VPS's `authorized_keys`, then sets each
-GitHub secret via the `gh` CLI. The four non-secret config values
-(`VPS_HOST`, `VPS_USER`, `VPS_PROJECT_PATH`, `PUBLIC_HEALTH_URL`)
-default to this project's real values, shown at each prompt, just
-press Enter to accept. `VPS_SSH_KEY` is set automatically from the
-generated key file; `OPENAI_API_KEY` prompts blank and is skipped
-until it's actually needed.
-
-## 2.2 Testing the pipeline locally before it touches production
-
-Both workflows can be run locally via `act`
-(https://github.com/nektos/act) before ever pushing, using
-`dev_scripts\test_code_checks_yml.bat` and
-`dev_scripts\test_deploy_yml.bat`. The latter deliberately only runs
-`verify-build`, never `deploy`, since that job genuinely modifies the
-live VPS. See the top-level `README.md`'s CI/CD section for why this
-matters, including a real bug this local testing already caught
-before any code was committed.
-
-A narrower check runs even earlier, at commit time: a git pre-commit
-hook (`.githooks\pre-commit`, wired in once via
-`dev_scripts\setup_git_hooks.bat`) runs `actionlint`/`shellcheck`
-against any staged workflow YAML or shell script and blocks the
-commit on a syntax error, the class of bug `act` only catches once it
-actually executes the broken step. This is a direct response to a
-real incident: an apostrophe inside a single-quoted `ssh '...'`
-remote command in `deploy-to-vps.yml`'s "Confirm Apache has the
-ProxyPass rule" step reached a real GitHub Actions run and broke it
-in production before this hook existed. See the top-level `README.md`
-CI/CD section for the full writeup and setup.
-
-## 2.3 Manual deployment (fallback reference)
-
-If the automated pipeline needs debugging, here's what it's doing
-under the hood, so the same steps can be run by hand over SSH if
-needed:
-
-**Connect:** SSH to the VPS as the deploy user, same access
-insight-engine-rag uses (Bluehost cPanel Terminal or PuTTY). See that
-project's `DEPLOYMENT_AND_ARCHITECTURE.md` section 1.1 for exact
-connection steps, unchanged here.
-
-**Project path:** this app's `VPS_PROJECT_PATH` must be a
-**different** directory than insight-engine-rag's, e.g. `/opt/label-verify`
-vs `/opt/rag`. Sharing a path would let the two deploys overwrite
-each other.
-
-**Backend**, runs as a Docker container rather than a bare Node
-process since the VPS host has no working Node install to run it on
-directly (see 1.2 above for why):
+```text
+GET  /health
+GET  /docs
+GET  /api/items
+GET  /api/items/:id
+POST /api/items
 ```
-cd $PROJECT/backend
-docker build -t ttb-label-verify-backend .
-docker rm -f ttb-label-verify-backend || true
+
+`/health` and `/docs` are system/infrastructure routes. `/api/items` is example application functionality and is expected to be replaced or expanded in a real project.
+
+When routes change, update both the implementation and `swagger-spec.ts` so Swagger describes the API that actually exists.
+
+## 1.6 Health and dependency diagnostics
+
+`GET /health` is designed to remain useful even when optional dependencies are unavailable.
+
+It reports:
+
+```text
+ok
+service
+timestamp
+database.connected / database.error
+outboundInternet.connected / outboundInternet.ip / outboundInternet.error
+```
+
+The database is optional at the generic-template stage. If `DATABASE_URL` is absent, the health response reports `Database not configured` rather than attempting authentication with incomplete configuration.
+
+The outbound-internet check uses the shared HTTP client and is intended to expose a common deployment problem: a service can be running while outbound traffic is blocked by container, VPC, firewall, or corporate-network policy.
+
+A real application should decide whether each dependency is merely diagnostic or required for readiness. If a dependency becomes mandatory, update health/readiness semantics accordingly.
+
+## 1.7 Database layer
+
+PostgreSQL support is included as a concrete starting point, not as a requirement that every derived application use PostgreSQL.
+
+The template includes:
+
+```text
+backend/src/db/pool.ts
+backend/scripts/setup-database.sql
+backend/scripts/setup-database.bat
+backend/scripts/seed-database.bat
+backend/seeds/001_database_seed.sql
+```
+
+The example Items service demonstrates database-backed resource access. A new application should replace the example schema, seed data, and Items queries with its own domain model.
+
+If the application does not need a database, the database layer and related health check can be removed. If another persistence technology is selected, replace the implementation rather than preserving PostgreSQL solely because the template included it.
+
+## 1.8 OpenAPI / Swagger
+
+Swagger UI is available at:
+
+```text
+GET /docs
+```
+
+The OpenAPI implementation deliberately combines generated schemas with explicit paths.
+
+Exported TypeScript interfaces tagged with `@openapi` are converted at build time into reusable OpenAPI component schemas:
+
+```text
+TypeScript interfaces
+    |
+    v
+scripts/generate-openapi-schemas.ts
+    |
+    v
+src/schemas.generated.ts
+    |
+    v
+swagger-spec.ts components.schemas
+```
+
+API paths, verbs, request bodies, status codes, summaries, and descriptions remain explicitly defined in `swagger-spec.ts`.
+
+The generator is tolerant of zero tagged interfaces and can produce an empty schema module. That is useful when the example API is removed before replacement contracts are added. Once a real API exists, tag the contracts that should appear in Swagger and keep the path definitions aligned with the real routes.
+
+## 1.9 Logging and errors
+
+Backend logging levels are:
+
+```text
+none
+summary
+verbose
+```
+
+`LOG_LEVEL=none` disables routine request/diagnostic logging. Startup information remains visible, including the listening port, Swagger URL, and selected logging level.
+
+Actual errors are also always written to the console through the centralized error path. Logging configuration should not make application failures invisible.
+
+Known application error types are mapped centrally. Unexpected errors return a generic server-error response so internal implementation details are not unnecessarily exposed to API callers.
+
+## 1.10 Frontend architecture
+
+The frontend is React + Vite and intentionally defaults to JavaScript.
+
+Current structure includes:
+
+- `App.jsx` — top-level UI/state composition.
+- `api/client.js` — backend communication boundary.
+- `components/` — reusable presentation components.
+- `logging/logger.js` — frontend diagnostic logging.
+- `App.css` — application styling.
+
+The template assumes a thin client with business/domain rules primarily behind the API boundary. JavaScript is therefore the lower-complexity default. If a real application's frontend develops substantial domain logic, complex state, shared models, larger team ownership, or significant refactoring risk, TypeScript should be reconsidered.
+
+## 1.11 Security baseline
+
+The template is not a finished security model.
+
+Before production use, explicitly review:
+
+- authentication and authorization;
+- CORS restrictions;
+- secret storage;
+- TLS/reverse-proxy configuration;
+- database credentials and network exposure;
+- external API credentials;
+- rate limiting and abuse controls where appropriate;
+- error-response information disclosure;
+- dependency and container patching;
+- logging/redaction requirements.
+
+`middleware/auth.ts` is scaffolding, not proof that authentication is configured.
+
+# PART 2: BUILD AND LOCAL DEVELOPMENT
+
+## 2.1 Backend
+
+From `backend/`:
+
+```bash
+npm run build
+npm run dev
+```
+
+`npm run build` performs schema generation before TypeScript compilation:
+
+```text
+npm run generate:schemas && tsc
+```
+
+The order matters because `swagger-spec.ts` imports the generated schema module.
+
+The development command uses `tsx` to run/watch the TypeScript source. Production-style execution uses the compiled output:
+
+```bash
+npm start
+```
+
+which runs:
+
+```text
+node dist/server.js
+```
+
+The backend defaults to port `3002` unless `PORT` is supplied.
+
+## 2.2 Frontend
+
+From `frontend/`:
+
+```bash
+npm run dev
+```
+
+Use the frontend README and `vite.config.js` as the source of truth for local API proxy/base-path behavior. Update those values when the derived application's public path or backend port changes.
+
+## 2.3 Optional database setup
+
+If the derived application uses the included PostgreSQL starting point, configure `DATABASE_URL` and run the supplied setup/seed scripts as appropriate.
+
+If no database is configured, the backend can still start and `/health` will report the database as not configured.
+
+# PART 3: DOCKER
+
+## 3.1 Backend image
+
+`backend/Dockerfile` provides a repeatable build/runtime environment independent of the host's installed Node environment.
+
+The current Dockerfile:
+
+1. installs dependencies, including build-time dev dependencies;
+2. generates OpenAPI schemas;
+3. compiles TypeScript;
+4. starts `node dist/server.js`.
+
+The supplied Dockerfile currently uses a Node Alpine base image and exposes the template backend port. When creating a real application, review the Node version, port, image naming, dependency-install strategy, runtime user, health check, and production hardening rather than treating the template values as permanent.
+
+## 3.2 Container naming and ports
+
+Use application-specific names when building and running a derived application:
+
+```bash
+docker build -t <app-name>-backend .
+
 docker run -d \
-  --name ttb-label-verify-backend \
+  --name <app-name>-backend \
   --restart unless-stopped \
-  -p 3002:3002 \
+  -p 127.0.0.1:<host-port>:<container-port> \
   --env-file .env \
-  ttb-label-verify-backend
+  <app-name>-backend
 ```
 
-**Frontend**, built inside a throwaway container since the VPS host
-has no working Node install at all, confirmed by insight-engine-rag's
-own deployment notes: a broken, extremely outdated Node environment
-missing required shared libraries (e.g. `libbrotlidec.so.1`). Node
-cannot run natively on this host, not just an unreliable version:
-```
-docker run --rm \
-  -v "$PROJECT/frontend:/app" \
-  -w /app \
-  node:20-alpine sh -c "npm install && npm run build"
-rsync -a --delete "$PROJECT/frontend/dist/" /home/leelinko/public_html/mvps/label-verify/
-```
+Binding to `127.0.0.1` is appropriate when a reverse proxy on the same host is intended to be the only public entry point. If the deployment architecture differs, change this deliberately.
 
-**Verify:**
-```
-curl -sf https://leelinkoff.com/mvps/label-verify/api/health
-```
+# PART 4: CI/CD SCAFFOLDING
 
-## 2.4 Apache reverse proxy
+## 4.1 Code checks
 
-**Not** a bare `/api/` proxy at the domain root, unlike an earlier
-draft of this doc assumed. insight-engine-rag's frontend is served
-at `/mvps/rag/`, but its backend proxy rule genuinely does sit at the
-domain root (`/api/`), confirmed directly against that project's own
-deployment doc. If this app's backend also proxied at the domain
-root, the two would fight over the same path, whichever Apache rule
-matches first wins, and the other app's API becomes unreachable.
-This app's proxy rule is nested under its own subpath instead, so it
-can't collide with anything else on the same VPS.
+`.github/workflows/code-checks.yml` is intended to provide early build verification for frontend and backend code.
 
-### Why different internal ports (3001 vs 3002) don't already solve this
+A derived project should make sure the workflow checks the routes and artifacts that actually exist. Any inherited references to placeholder or previous-application endpoints must be updated before relying on the workflow as a meaningful quality gate.
 
-They solve a different problem. Apache decides which `ProxyPass` rule
-to use based entirely on the incoming request's **URL path**, before
-it ever looks at where that rule points to. If two rules both matched
-`/api/`, Apache picks one, the other never fires for any `/api/*`
-request, full stop. The target ports only matter *after* a rule has
-already been selected, they have no bearing on which rule Apache
-chooses in the first place. Ports keep the two Docker containers from
-colliding with each other on the VPS (two processes can't both bind
-the same port), but that's a completely separate problem from two
-public URL patterns colliding at the Apache layer. Giving each app
-its own path prefix is what actually fixes the URL-matching
-collision, the ports were never going to.
+Useful baseline checks include:
 
-### This is a manual, one-time step, not automated
+- dependency installation;
+- frontend production build;
+- OpenAPI schema generation;
+- strict TypeScript type-check;
+- backend compilation;
+- compiled-server boot test;
+- health response validation;
+- Swagger availability;
+- application-specific smoke tests.
 
-`deploy-to-vps.yml` deploys the app (syncs source, rebuilds the
-Docker container, publishes the frontend) but does **not** touch
-Apache's configuration. Until this block is added by hand, the
-pipeline's final health-check step will fail with a 404, Apache has
-no rule routing `/mvps/label-verify/api/` anywhere, so it falls
-through to a plain "not found" response. This only needs doing once;
-after that, every future deploy just works.
+## 4.2 Local workflow testing
 
-### Config file location
+The `dev_scripts/` directory includes helpers for running GitHub Actions locally with `act` and for linting workflows/git hooks.
 
-Same file insight-engine-rag's own `/api/` rule lives in, confirmed
-against this specific server:
+These scripts are conveniences, not architectural requirements. Keep, modify, or remove them according to the derived project's development environment.
 
-```
-/etc/apache2/conf.d/includes/post_virtualhost_global.conf
+## 4.3 Deployment workflow
+
+`.github/workflows/deploy-to-vps.yml` is **deployment scaffolding**, not a universal production deployment.
+
+Before enabling it for a real application, review the entire workflow and replace all application/environment-specific values, including any inherited:
+
+- application/container/image names;
+- VPS paths;
+- Apache/static-publication paths;
+- backend ports;
+- public health URLs;
+- required and optional secrets;
+- environment-file generation;
+- smoke-test endpoints;
+- reverse-proxy checks;
+- frontend build/publication destinations.
+
+Do not deploy the generic template workflow unchanged merely because local builds pass.
+
+# PART 5: REVERSE PROXY / VPS DEPLOYMENT PATTERN
+
+The included deployment material assumes one possible pattern:
+
+```text
+Internet
+   |
+ HTTPS
+   v
+Apache/reverse proxy
+   |----------------------> static frontend files
+   |
+   +-- application API --> backend container bound to localhost
 ```
 
-This is a cPanel EasyApache (EA4) install. The config tree lives
-under `/etc/apache2/`, but the actual service and binary are named
-`httpd` (`/usr/sbin/httpd`, `systemctl status httpd`), not `apache2`,
-that's a cPanel packaging convention. Using `systemctl restart apache2`
-here will fail or silently do nothing; it has to be `httpd`.
+A derived application may use this pattern, a managed cloud platform, Kubernetes, serverless functions, a PaaS, another reverse proxy, or no container at all. The correct choice depends on the actual deployment environment.
 
-### Config to add
+If Apache on a shared VPS is used, give every application a unique public path and/or hostname and a unique internal port where necessary. Verify the real server's Apache layout and restart/reload procedure rather than assuming paths or commands from another host.
 
-Append this block to the same file, alongside insight-engine-rag's
-existing `/api/` block, not a separate file:
+Example only:
 
 ```apache
 <IfModule mod_proxy.c>
     ProxyPreserveHost On
-    ProxyPass "/mvps/label-verify/api/" "http://127.0.0.1:3002/api/"
-    ProxyPassReverse "/mvps/label-verify/api/" "http://127.0.0.1:3002/api/"
+    ProxyPass "/apps/<app-name>/api/" "http://127.0.0.1:<port>/api/"
+    ProxyPassReverse "/apps/<app-name>/api/" "http://127.0.0.1:<port>/api/"
 </IfModule>
 ```
 
-### Apply it
+This is a pattern to adapt, not a ready-to-paste universal configuration.
 
-```
-apachectl -t
-/usr/local/cpanel/scripts/restartsrv_httpd --graceful
-```
+# PART 6: ENVIRONMENT AND SECRETS
 
-Always run `-t` (syntax check) first, a syntax error here would take
-down Apache for every site on the VPS, including insight-engine-rag,
-not just this app.
+The generic backend currently recognizes values such as:
 
-Use the cPanel service script, not `systemctl restart httpd`
-directly. Confirmed on this exact VPS: `systemctl restart httpd`
-completed with no error, but Apache continued serving the old config
-regardless, real requests kept 404ing even though `apachectl -t`
-reported the new config as valid. `/usr/local/cpanel/scripts/restartsrv_httpd --graceful`
-is what actually got the new config live. cPanel manages its own
-service state around `httpd`, and that state can drift out of sync
-with what `systemctl` sees, using cPanel's own script avoids that.
-
-### Verify
-
-```
-curl -sf https://leelinkoff.com/mvps/label-verify/api/health
+```text
+PORT
+LOG_LEVEL
+DATABASE_URL
 ```
 
-Once this returns a healthy JSON response, re-run (or just wait for
-the next push to trigger) `deploy-to-vps.yml`, its own health-check
-step will now pass.
+The frontend has its own Vite environment values, which are exposed to browser code when prefixed with `VITE_`. Never place secrets in client-visible Vite variables.
 
-The frontend calls this same prefixed path, built from
-`import.meta.env.BASE_URL` in `App.jsx` rather than hardcoded as
-`/api/...`, so it resolves correctly in both dev (Vite's dev server
-proxy, configured in `vite.config.js` with a matching rewrite that
-strips the prefix before forwarding to the backend) and production
-(this Apache rule). `PUBLIC_HEALTH_URL` in repo secrets should be set
-to `https://leelinkoff.com/mvps/label-verify/api/health`, not a bare
-`/api/health` path, and not the placeholder `/api/label-verify-health`
-path an earlier draft of this doc used, that path was never real.
+As application-specific integrations are added, document each required/optional environment variable and its purpose. Do not carry secrets from the template or another application into a new repository.
 
-Internal port 3002 is never exposed publicly. All public traffic
-reaches the backend only through Apache's reverse proxy.
+A real deployment should clearly distinguish:
 
-## 2.5 Rotating the OpenAI API key
+- required runtime configuration;
+- optional feature configuration;
+- secrets;
+- public frontend build-time configuration;
+- deployment-only credentials.
 
-`services/extraction.ts` calls a real OpenAI vision model, so
-`OPENAI_API_KEY` is required, not optional, for `/api/verify` and
-`/api/verify/batch` to work. Rotate the key by updating the
-`OPENAI_API_KEY` GitHub repository secret only. The next deploy
-writes it to the VPS automatically, same single-touch-point rotation
-insight-engine-rag uses, no manual `.env` editing on the VPS itself
-required. `OPENAI_VISION_MODEL` (optional, overrides the default
-vision model) follows the same rotation pattern if set.
+# PART 7: WHAT MUST BE UPDATED FOR A REAL APPLICATION
 
-## 2.6 Security notes
+Before treating a project created from this template as deployable, replace template assumptions with real decisions for:
 
-- No authentication on any endpoint currently, consistent with
-  Marcus's stated assumption that this prototype stores nothing
-  sensitive. Revisit before any real-data deployment.
-- CORS is fully open. Fine for a demo, would need restricting before
-  production use.
-- Internal port 3002 never exposed publicly, matches insight-engine-rag's
-  pattern exactly. **Unverified as written**: the actual `docker run`
-  command in 2.3 and in `deploy-to-vps.yml` uses `-p 3002:3002`, which
-  binds all interfaces (`0.0.0.0:3002`), not `127.0.0.1:3002`. `EXPOSE
-  3002` in the Dockerfile is documentation only, it doesn't restrict
-  anything. This claim is only true if something else on the VPS (a
-  firewall, UFW, a cloud security group) separately blocks inbound
-  3002, that hasn't been confirmed. If nothing else blocks it, this
-  port is reachable directly from the internet right now, bypassing
-  Apache entirely, and the fix is `-p 127.0.0.1:3002:3002` in both the
-  command below and `deploy-to-vps.yml`'s `docker run` step.
-- `backend/.env` is written in plaintext on the VPS via `--env-file`,
-  same accepted tradeoff insight-engine-rag documents: a secrets
-  manager would avoid this but is disproportionate infrastructure for
-  a prototype handling no sensitive data.
+1. application name and purpose;
+2. API routes and OpenAPI documentation;
+3. example Items resource/schema/seed data;
+4. database/persistence choice;
+5. health/readiness semantics;
+6. authentication and authorization;
+7. CORS and other security controls;
+8. external APIs and secrets;
+9. frontend JavaScript vs. TypeScript decision;
+10. backend/frontend ports and public base paths;
+11. Docker image/container names and Node version;
+12. CI smoke tests;
+13. deployment target and workflow;
+14. reverse-proxy/static-file configuration, if used;
+15. logging, monitoring, backup, availability, and scaling requirements.
+
+The template should make those decisions easier to implement, but it should not make them silently on behalf of an application whose requirements are not yet known.

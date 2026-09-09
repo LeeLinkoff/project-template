@@ -36,6 +36,8 @@ Reusable starting point for React + Node/Express applications with a clean front
 ## Structure
 
 ```text
+IMPORTANT_RUN_FIRST.bat (one-time dependency setup after copying the template)
+
 backend/
 ├── scripts/
 │   └── generate-openapi-schemas.ts
@@ -320,16 +322,30 @@ swagger-spec.ts
 
 Schema generation must occur before TypeScript compilation because `swagger-spec.ts` imports the generated schema module.
 
+## First-Time Project Setup
+
+Immediately after creating a new project from this template, run from the project root:
+
+```bat
+IMPORTANT_RUN_FIRST.bat
+```
+
+This is a **one-time bootstrap step**. It runs `npm install` in both `backend/` and `frontend/`, stops with an error if either installation fails, and reports when project setup is complete. After it succeeds, normal development and build commands can be used without running it again unless dependencies need to be reinstalled.
+
+As the template is adapted into a real application, update this script if that application gains additional first-run setup requirements.
+
 ## Local Development
 
 ### Backend
 
+After the one-time root setup above:
+
 ```bash
 cd backend
-npm install
-npm run generate:schemas
 npm run dev
 ```
+
+The build process runs OpenAPI schema generation before TypeScript compilation. Run `npm run generate:schemas` directly only when you specifically want to regenerate the schema module without performing a full build.
 
 Default backend:
 
@@ -363,9 +379,10 @@ LOG_LEVEL=verbose
 
 ### Frontend
 
+After the one-time root setup above:
+
 ```bash
 cd frontend
-npm install
 npm run dev
 ```
 
@@ -494,7 +511,7 @@ Do not use `VITE_*` variables for secrets.
 
 ## Creating a New Application
 
-Copy the template and replace:
+Copy the template, run `IMPORTANT_RUN_FIRST.bat` once from the project root, and then replace:
 
 1. application name and description
 2. deployment path

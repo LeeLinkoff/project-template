@@ -1,36 +1,38 @@
 // server.ts
 //
-// Generic API backend. Thin routing layer only: each endpoint parses the
-// request, calls a service function, and shapes the response. Business logic
-// lives in services/ so routes remain small, testable, and easy to replace
-// or move later without changing the underlying application logic.
+// Generic API backend. Thin routing layer only: routes live in routes/,
+// business logic lives in services/, error-response mapping lives in
+// middleware/errors.ts. This file just wires everything together and
+// starts the server.
 //
 // Endpoints:
-//   GET  /api/health        — liveness check
-//   GET  /api/docs          — Swagger UI
-//   GET  /api/items         — example list endpoint
-//   GET  /api/items/:id     — example lookup endpoint
-//   POST /api/items         — example create endpoint
+//
+//   GET  /health             — liveness check           (routes/system_router.ts)
+//   GET  /docs               — Swagger UI               (routes/system_router.ts)
+//
+//   GET  /api/items          — example list endpoint    (routes/items_router.ts)
+//   GET  /api/items/:id      — example lookup endpoint  (routes/items_router.ts)
+//   POST /api/items          — example create endpoint  (routes/items_router.ts)
+
 
 import "dotenv/config";
-import express, { Request, Response } from "express";
+import express from "express";
 import cors from "cors";
-import swaggerUi from "swagger-ui-express";
-import swaggerSpec from "./swagger-spec";
-import { LOG_LEVEL, logSummary, requestLogger } from "./logging/logger";
 
-import {
-  createItem,
-  getItemById,
-  listItems,
-  CreateItemRequest
-} from "./services/items";
+// NodeNext/ESM requires explicit file extensions for relative imports.
+// Local TypeScript modules therefore use the runtime .js extension even
+// though the corresponding source files have a .ts extension. TypeScript
+// resolves these imports to the .ts source during compilation, while the
+// emitted JavaScript retains .js so it can run directly under Node.js.
+import { LOG_LEVEL, logSummary, requestLogger } from "./logging/logger.js";
+import { errorHandler } from "./middleware/errors.js";
+import systemRouter from "./routes/system_router.js";
+import itemsRouter from "./routes/items_router.js";
+
 
 const app = express();
 const PORT = process.env.PORT || 3002;
 
-app.use(cors());
-app.use(express.json());
 
 app.use(cors());
 app.use(express.json());
@@ -48,73 +50,22 @@ app.use(express.json());
 // At LOG_LEVEL=none, it immediately calls next() without logging anything.
 app.use(requestLogger);
 
-/**
- * GET /api/health
- */
-app.get("/api/health", (_req: Request, res: Response) => {
-app.use(requestLogger);
 
-/**
- * GET /api/health
- */
-app.get("/api/health", (_req: Request, res: Response) => {
-  res.json({
-    ok: true,
-    service: "generic-backend",
-    timestamp: new Date().toISOString()
-  });
-});
+// System/infra routes — unversioned, not under /api.
+app.use("/", systemRouter);
 
-/**
- * GET /api/docs
- */
-app.use("/api/docs", swaggerUi.serve, swaggerUi.setup(swaggerSpec));
+// Business API routes.
+app.use("/api/items", itemsRouter);
 
-/**
- * GET /api/items
- */
-app.get("/api/items", (_req: Request, res: Response) => {
-  res.json({
-    items: listItems()
-  });
-});
 
-/**
- * GET /api/items/:id
- */
-app.get("/api/items/:id", (req: Request, res: Response) => {
-  const item = getItemById(req.params.id);
+// Central error handler
+// !! must be registered LAST, after all routes. !!
+app.use(errorHandler);
 
-  if (!item) {
-    res.status(404).json({
-      ok: false,
-      error: "Item not found"
-    });
-    return;
-  }
 
-  res.json(item);
-});
-
-/**
- * POST /api/items
- */
-app.post("/api/items", (req: Request, res: Response) => {
-  try {
-    const payload = req.body as CreateItemRequest;
-    const item = createItem(payload);
-    res.status(201).json(item);
-  } catch (err) {
-    const message = err instanceof Error ? err.message : String(err);
-    res.status(400).json({
-      ok: false,
-      error: message
-    });
-  }
-});
-
-app.listen(PORT, () => {
-  logSummary(`generic-backend listening on port ${PORT}`);
-  logSummary(`Swagger docs: http://localhost:${PORT}/api/docs`);
-  logSummary(`Logging: ${LOG_LEVEL}`);
+app.listen(PORT, () => 
+{
+  console.log(`generic-backend listening on port ${PORT}`);
+  console.log(`Swagger docs: http://localhost:${PORT}/docs`);
+  console.log(`Logging: ${LOG_LEVEL}`);
 });

@@ -8,8 +8,21 @@
 // `paths` remains hand-maintained because route verbs, request bodies, response
 // codes, and descriptions are HTTP metadata rather than TypeScript type data.
 
-import { generatedSchemas } from "./schemas.generated";
 
+// NodeNext/ESM requires explicit file extensions for relative imports.
+// Local TypeScript modules therefore use the runtime .js extension even
+// though the corresponding source files have a .ts extension. TypeScript
+// resolves these imports to the .ts source during compilation, while the
+// emitted JavaScript retains .js so it can run directly under Node.js.
+import { generatedSchemas } from "./schemas.generated.js";
+
+
+// Documents the actual API endpoints (request/response shapes, status
+// codes).
+// NOT included here: /docs itself.
+// That route serves the Swagger UI page (via swaggerUi.serve/setup in system_router.ts), which
+// reads this whole spec object to render it. It's the tool displaying the documentation, 
+// not an API endpoint returning data, so there's nothing meaningful to describe about it in OpenAPI terms.
 const swaggerSpec = {
   openapi: "3.0.3",
 
@@ -54,25 +67,19 @@ const swaggerSpec = {
   },
 
   paths: {
-    "/api/health": {
+    "/health": {
       get: {
         tags: ["Diagnostics"],
         summary: "Health check",
-        description:
-          "Returns service status. Used to confirm the backend is reachable and responding.",
+        description: "Returns service status. Used to confirm the backend is reachable and responding.",
         responses: {
           "200": {
             description: "Service is healthy",
             content: {
               "application/json": {
-                schema: {
-                  type: "object",
-                  properties: {
-                    ok: { type: "boolean", example: true },
-                    service: { type: "string", example: "generic-backend" },
-                    timestamp: { type: "string", format: "date-time" }
-                  }
-                }
+				schema: {
+				  $ref: "#/components/schemas/HealthStatus"
+				}
               }
             }
           }
@@ -171,5 +178,6 @@ const swaggerSpec = {
     }
   }
 };
+
 
 export default swaggerSpec;
